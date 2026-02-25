@@ -13,9 +13,11 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
   pageFingerprint,
   findBestPageMatch,
+  findPagesByTitle,
   detectDigitalSignature,
   detectPhysicalSignatureMarkers,
   ocrIfNeeded,
+  ROW_TITLE_PATTERNS,
   type PageData,
 } from "@/lib/pdf-utils";
 
@@ -146,6 +148,96 @@ describe("Scenario 2 – scanned PDF page (OCR fallback)", () => {
     const [best] = findBestPageMatch(tenderFp, pages);
     expect(best.pageNumber).toBe(10);
     expect(best.confidence).toBeGreaterThan(0.3);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scenario 2b: findPagesByTitle — NIT section title detection
+// ─────────────────────────────────────────────────────────────────────────────
+describe("findPagesByTitle — NIT section title detection", () => {
+  const pages: PageData[] = [
+    {
+      pageNumber: 1,
+      text: "General Terms and Conditions\nThis document sets out...",
+      imageDataUrl: "",
+    },
+    {
+      pageNumber: 2,
+      text: "SECTION – 3\nTECHNICAL SPECIFICATION\n\nAll items shall comply with IS standards.",
+      imageDataUrl: "",
+    },
+    {
+      pageNumber: 3,
+      text: "8.3 - COMPLIANCE TO BID REQUIREMENTS DEVIATION SHEET\nDescription | Tender Spec | Offered Spec",
+      imageDataUrl: "",
+    },
+    {
+      pageNumber: 4,
+      text: "Section 3 Technical Specification continuation page",
+      imageDataUrl: "",
+    },
+    {
+      pageNumber: 5,
+      text: "Price schedule and payment terms.",
+      imageDataUrl: "",
+    },
+  ];
+
+  it("finds page with exact em-dash title 'SECTION – 3'", () => {
+    const found = findPagesByTitle(pages, ROW_TITLE_PATTERNS[1]);
+    const pageNums = found.map((p) => p.pageNumber);
+    expect(pageNums).toContain(2);
+  });
+
+  it("finds page with hyphen variant 'section - 3'", () => {
+    const pagesWithHyphen: PageData[] = [
+      {
+        pageNumber: 10,
+        text: "SECTION - 3\nTechnical Specification\nContent here.",
+        imageDataUrl: "",
+      },
+    ];
+    const found = findPagesByTitle(pagesWithHyphen, ROW_TITLE_PATTERNS[1]);
+    expect(found.length).toBe(1);
+    expect(found[0].pageNumber).toBe(10);
+  });
+
+  it("finds deviation sheet page", () => {
+    const found = findPagesByTitle(pages, ROW_TITLE_PATTERNS[2]);
+    const pageNums = found.map((p) => p.pageNumber);
+    expect(pageNums).toContain(3);
+  });
+
+  it("returns empty when no page matches", () => {
+    const found = findPagesByTitle(pages, ["completely unrelated heading"]);
+    expect(found).toHaveLength(0);
+  });
+
+  it("does not match title patterns found deep in page body (beyond header zone)", () => {
+    const deepMatchPage: PageData[] = [
+      {
+        pageNumber: 20,
+        // Title pattern appears past 600 chars — should NOT match
+        text:
+          "A".repeat(601) +
+          "SECTION – 3 appears here but this is not the title.",
+        imageDataUrl: "",
+      },
+    ];
+    const found = findPagesByTitle(deepMatchPage, ROW_TITLE_PATTERNS[1]);
+    expect(found).toHaveLength(0);
+  });
+
+  it("ROW_TITLE_PATTERNS[1] contains expected section-3 keywords", () => {
+    expect(ROW_TITLE_PATTERNS[1]).toContain("section – 3");
+    expect(ROW_TITLE_PATTERNS[1]).toContain("technical specification");
+  });
+
+  it("ROW_TITLE_PATTERNS[2] contains deviation sheet keyword", () => {
+    expect(ROW_TITLE_PATTERNS[2]).toContain(
+      "8.3 - compliance to bid requirements deviation sheet"
+    );
+    expect(ROW_TITLE_PATTERNS[2]).toContain("nil deviation");
   });
 });
 

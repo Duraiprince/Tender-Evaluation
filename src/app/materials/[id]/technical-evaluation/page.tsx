@@ -3,9 +3,9 @@
 import AppLayout from "@/components/AppLayout";
 import Link from "next/link";
 import { useParams, useSearchParams } from "next/navigation";
-import { useState, useMemo, useEffect, useCallback, useRef } from "react";
+import { useState, useMemo, useEffect, useCallback } from "react";
 import { getBidderZip } from "@/lib/bidder-store";
-import { setTenderPdf, getTenderPdf, hasTenderPdf } from "@/lib/tender-store";
+import { getNitZip, hasNitZip } from "@/lib/nit-store";
 
 interface EvaluationRow {
   id: number;
@@ -50,6 +50,13 @@ interface TenderMatchCandidate {
   pageData: { pageNumber: number; text: string; imageDataUrl: string };
 }
 
+interface TenderPageRef {
+  pageNumber: number;
+  documentName: string;
+  imageDataUrl: string;
+  text: string;
+}
+
 interface TenderMatchResult {
   status:
     | "match_signed_digital"
@@ -63,12 +70,13 @@ interface TenderMatchResult {
     digital: { detected: boolean; signerName?: string; signingTime?: string; validityStatus?: string };
     physical: { detected: boolean; indicators: string[] };
   } | null;
+  tenderPage: TenderPageRef | null;
 }
 
-// Row id → tender page index (0-based)
-const ROW_TENDER_PAGE_MAP: Record<number, number> = {
-  1: 66, // Technical Specification → page 67 of tender (0-indexed: 66)
-  2: 66, // NIL Deviation Statement (same section; change as needed)
+// Human-readable section labels per row id
+const ROW_SECTION_LABEL: Record<number, string> = {
+  1: "SECTION – 3 (Technical Specification)",
+  2: "8.3 – Compliance to Bid Requirements Deviation Sheet",
 };
 
 export default function TechnicalEvaluationPage() {
@@ -108,15 +116,13 @@ export default function TechnicalEvaluationPage() {
   const [processingError, setProcessingError] = useState<Record<string, string>>({});
   const [expandedImage, setExpandedImage] = useState<string | null>(null);
 
-  // Tender PDF upload
-  const tenderInputRef = useRef<HTMLInputElement>(null);
-  const [tenderPdfName, setTenderPdfName] = useState<string>("");
-
   // Tender page match state: key = `${bidder}:${rowId}`
   const [matchResults, setMatchResults] = useState<Record<string, TenderMatchResult>>({});
   const [matchLoading, setMatchLoading] = useState<Record<string, boolean>>({});
   const [matchError, setMatchError] = useState<Record<string, string>>({});
-  const [matchPanelKey, setMatchPanelKey] = useState<string | null>(null);
+
+  // Whether the NIT zip is available (set on the upload page)
+  const nitAvailable = hasNitZip();
 
   const activeBidder = bidders[activeTab] ?? "";
   const activeEval = evaluations[activeBidder];
@@ -175,34 +181,24 @@ export default function TechnicalEvaluationPage() {
     }
   }, [activeBidder, processingState, processBidderDocs]);
 
-  // Tender PDF upload handler
-  const handleTenderPdfUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0] ?? null;
-    setTenderPdf(file);
-    setTenderPdfName(file?.name ?? "");
-  };
-
-  // Run the tender page match for a specific row
+  // Run the tender page match for a specific row using stored NIT zip + bidder offer zip
   const runTenderPageMatch = useCallback(
     async (bidder: string, rowId: number) => {
-      const tenderPdf = getTenderPdf();
-      if (!tenderPdf) return;
       const offerZip = getBidderZip();
       if (!offerZip) return;
 
       const key = `${bidder}:${rowId}`;
-      const tenderPageIndex = ROW_TENDER_PAGE_MAP[rowId] ?? 0;
-
       setMatchLoading((p) => ({ ...p, [key]: true }));
       setMatchError((p) => ({ ...p, [key]: "" }));
-      setMatchPanelKey(key);
 
       try {
         const formData = new FormData();
-        formData.append("tenderPdf", tenderPdf);
         formData.append("offerZip", offerZip);
         formData.append("bidder", bidder);
-        formData.append("tenderPageIndex", String(tenderPageIndex));
+        formData.append("rowId", String(rowId));
+
+        const nitZip = getNitZip();
+        if (nitZip) formData.append("nitZip", nitZip);
 
         const res = await fetch("/api/match-tender-page", {
           method: "POST",
@@ -432,9 +428,9 @@ export default function TechnicalEvaluationPage() {
     const isLoading = matchLoading[key];
     const error = matchError[key];
     const result = matchResults[key];
+    const sectionLabel = ROW_SECTION_LABEL[rowId] ?? "Tender Section";
 
-    if (!hasTenderPdf()) return null;
-
+    // Initial state: show a trigger button
     if (!result && !isLoading && !error) {
       return (
         <button
@@ -444,7 +440,7 @@ export default function TechnicalEvaluationPage() {
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
           </svg>
-          Match against Tender Page {(ROW_TENDER_PAGE_MAP[rowId] ?? 0) + 1}
+          {nitAvailable ? "Match against Tender Document" : "Find section match (no NIT uploaded)"}
         </button>
       );
     }
@@ -453,7 +449,7 @@ export default function TechnicalEvaluationPage() {
       return (
         <div className="mt-2 flex items-center gap-2 text-xs text-indigo-600 bg-indigo-50 border border-indigo-200 rounded-lg px-3 py-2">
           <div className="w-3.5 h-3.5 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin flex-shrink-0" />
-          Scanning bidder documents for tender page match…
+          Scanning documents for <span className="font-semibold ml-1">{sectionLabel}</span>…
         </div>
       );
     }
@@ -467,10 +463,7 @@ export default function TechnicalEvaluationPage() {
             </svg>
             {error}
           </div>
-          <button
-            onClick={() => runTenderPageMatch(activeBidder, rowId)}
-            className="text-xs text-indigo-600 hover:underline"
-          >
+          <button onClick={() => runTenderPageMatch(activeBidder, rowId)} className="text-xs text-indigo-600 hover:underline">
             Retry
           </button>
         </div>
@@ -479,27 +472,46 @@ export default function TechnicalEvaluationPage() {
 
     if (!result) return null;
 
-    const { status, match, signatureInfo } = result;
+    const { status, match, signatureInfo, tenderPage } = result;
 
+    // No match found
     if (status === "no_match" || !match) {
       return (
-        <div className="mt-2 flex items-center gap-2 text-xs font-medium text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <circle cx="12" cy="12" r="10" /><line x1="15" y1="9" x2="9" y2="15" /><line x1="9" y1="9" x2="15" y2="15" />
-          </svg>
-          {activeBidder} has not submitted a matching copy of Tender Page {(ROW_TENDER_PAGE_MAP[rowId] ?? 0) + 1}
+        <div className="mt-2 space-y-2">
+          <div className="flex items-start gap-2 text-xs font-medium text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="flex-shrink-0 mt-0.5">
+              <circle cx="12" cy="12" r="10" /><line x1="15" y1="9" x2="9" y2="15" /><line x1="9" y1="9" x2="15" y2="15" />
+            </svg>
+            <span>{activeBidder} has not submitted a signed copy of the tender page for <em>{sectionLabel}</em></span>
+          </div>
+          {/* Show the tender reference page so evaluator can compare */}
+          {tenderPage?.imageDataUrl && (
+            <div className="border border-gray-200 rounded-lg overflow-hidden">
+              <div className="px-2 py-1 bg-gray-50 border-b border-gray-200 text-xs text-gray-500 font-medium">
+                Tender reference — {tenderPage.documentName}, Page {tenderPage.pageNumber}
+              </div>
+              <div className="cursor-pointer group" onClick={() => setExpandedImage(tenderPage.imageDataUrl)}>
+                <img src={tenderPage.imageDataUrl} alt="Tender reference page" className="w-full h-auto max-h-48 object-contain bg-white" />
+                <div className="absolute inset-0 bg-black/0 group-hover:bg-black/10 transition-colors" />
+              </div>
+            </div>
+          )}
+          <button onClick={() => runTenderPageMatch(activeBidder, rowId)} className="text-xs text-indigo-600 hover:underline flex items-center gap-1">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="23 4 23 10 17 10" /><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10" />
+            </svg>
+            Re-scan
+          </button>
         </div>
       );
     }
 
+    // Match found — determine signature label
     const sigLabel =
-      status === "match_signed_both"
-        ? "Digitally & Physically Signed"
-        : status === "match_signed_digital"
-          ? "Digitally Signed"
-          : status === "match_signed_physical"
-            ? "Physically Signed"
-            : null;
+      status === "match_signed_both" ? "Digitally & Physically Signed"
+      : status === "match_signed_digital" ? "Digitally Signed"
+      : status === "match_signed_physical" ? "Physically Signed"
+      : null;
 
     const confidencePct = Math.round(match.confidence * 100);
 
@@ -507,28 +519,25 @@ export default function TechnicalEvaluationPage() {
       <div className="mt-2 border border-indigo-200 rounded-xl overflow-hidden">
         {/* Header */}
         <div className="flex items-center justify-between px-3 py-2 bg-indigo-50 border-b border-indigo-200">
-          <span className="text-xs font-semibold text-indigo-800">
-            Tender Page Match — {match.documentName}, Page {match.pageNumber}
-          </span>
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-indigo-600 font-medium">
-              {confidencePct}% confidence
-            </span>
-            <button
-              onClick={() => runTenderPageMatch(activeBidder, rowId)}
-              title="Re-run match"
-              className="text-indigo-500 hover:text-indigo-700 transition-colors"
-            >
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="23 4 23 10 17 10" />
-                <path d="M20.49 15a9 9 0 11-2.12-9.36L23 10" />
-              </svg>
-            </button>
+          <div className="min-w-0">
+            <p className="text-xs font-semibold text-indigo-800 truncate">
+              {match.documentName} — Page {match.pageNumber}
+            </p>
+            <p className="text-xs text-indigo-500">{confidencePct}% match · {sectionLabel}</p>
           </div>
+          <button
+            onClick={() => runTenderPageMatch(activeBidder, rowId)}
+            title="Re-run match"
+            className="ml-2 flex-shrink-0 text-indigo-400 hover:text-indigo-700 transition-colors"
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="23 4 23 10 17 10" /><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10" />
+            </svg>
+          </button>
         </div>
 
-        {/* Signature badges */}
-        <div className="px-3 py-2 flex flex-wrap gap-2 bg-white border-b border-indigo-100">
+        {/* Signature badge row */}
+        <div className="px-3 py-2 flex flex-wrap items-center gap-2 bg-white border-b border-indigo-100">
           {sigLabel ? (
             <span className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-full px-2.5 py-0.5">
               <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
@@ -544,39 +553,48 @@ export default function TechnicalEvaluationPage() {
               Match found but signature not detected
             </span>
           )}
-
           {signatureInfo?.digital.detected && (
             <span className="text-xs text-gray-500">
               Signer: {signatureInfo.digital.signerName ?? "Unknown"}
               {signatureInfo.digital.signingTime && ` · ${signatureInfo.digital.signingTime}`}
             </span>
           )}
-
           {signatureInfo?.physical.detected && signatureInfo.physical.indicators.length > 0 && (
-            <span className="text-xs text-gray-500">
-              Markers: {signatureInfo.physical.indicators.slice(0, 3).join(", ")}
+            <span className="text-xs text-gray-400">
+              Indicators: {signatureInfo.physical.indicators.slice(0, 3).join(", ")}
             </span>
           )}
         </div>
 
-        {/* Page image */}
-        {match.pageData.imageDataUrl && (
-          <div
-            className="relative cursor-pointer group"
-            onClick={() => setExpandedImage(match.pageData.imageDataUrl)}
-          >
-            <img
-              src={match.pageData.imageDataUrl}
-              alt={`${match.documentName} page ${match.pageNumber}`}
-              className="w-full h-auto max-h-64 object-contain bg-gray-50"
-            />
-            <div className="absolute inset-0 bg-black/0 group-hover:bg-black/10 transition-colors flex items-center justify-center">
-              <span className="opacity-0 group-hover:opacity-100 transition-opacity text-xs bg-black/60 text-white px-2 py-1 rounded">
-                Click to expand
-              </span>
+        {/* Side-by-side: tender reference page vs bidder submitted page */}
+        <div className={`grid gap-px bg-gray-200 ${tenderPage?.imageDataUrl ? "grid-cols-2" : "grid-cols-1"}`}>
+          {tenderPage?.imageDataUrl && (
+            <div className="bg-white">
+              <div className="px-2 py-1 text-xs text-gray-500 font-medium bg-gray-50 border-b border-gray-200">
+                Tender — {tenderPage.documentName}, pg.{tenderPage.pageNumber}
+              </div>
+              <div className="cursor-pointer group relative" onClick={() => setExpandedImage(tenderPage.imageDataUrl)}>
+                <img src={tenderPage.imageDataUrl} alt="Tender reference" className="w-full h-auto max-h-64 object-contain bg-white" />
+                <div className="absolute inset-0 bg-black/0 group-hover:bg-black/10 transition-colors flex items-center justify-center">
+                  <span className="opacity-0 group-hover:opacity-100 transition-opacity text-xs bg-black/60 text-white px-2 py-1 rounded">Expand</span>
+                </div>
+              </div>
             </div>
-          </div>
-        )}
+          )}
+          {match.pageData.imageDataUrl && (
+            <div className="bg-white">
+              <div className="px-2 py-1 text-xs text-gray-500 font-medium bg-gray-50 border-b border-gray-200">
+                {activeBidder} — {match.documentName}, pg.{match.pageNumber}
+              </div>
+              <div className="cursor-pointer group relative" onClick={() => setExpandedImage(match.pageData.imageDataUrl)}>
+                <img src={match.pageData.imageDataUrl} alt={`${activeBidder} submitted page`} className="w-full h-auto max-h-64 object-contain bg-white" />
+                <div className="absolute inset-0 bg-black/0 group-hover:bg-black/10 transition-colors flex items-center justify-center">
+                  <span className="opacity-0 group-hover:opacity-100 transition-opacity text-xs bg-black/60 text-white px-2 py-1 rounded">Expand</span>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
       </div>
     );
   };
@@ -701,55 +719,22 @@ export default function TechnicalEvaluationPage() {
           </div>
         ) : (
           <>
-            {/* Tender PDF Upload Strip */}
-            <div className="bg-white border border-gray-200 rounded-xl shadow-sm mb-6 overflow-hidden">
-              <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
-                <div>
-                  <h2 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">
-                    Tender Document (for Page Match)
-                  </h2>
-                  <p className="text-xs text-gray-400 mt-0.5">
-                    Upload the tender PDF to enable page-by-page matching against bidder submissions
-                  </p>
-                </div>
-                {tenderPdfName && (
-                  <span className="text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-1.5">
-                    {tenderPdfName}
-                  </span>
-                )}
+            {/* NIT zip availability notice */}
+            {nitAvailable ? (
+              <div className="flex items-center gap-2 text-xs text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-lg px-4 py-2.5 mb-6">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="flex-shrink-0">
+                  <path d="M9 12l2 2 4-4" /><circle cx="12" cy="12" r="10" />
+                </svg>
+                Tender / NIT document is loaded — click <strong className="mx-1">Match against Tender Document</strong> on rows 1 &amp; 2 to find and verify the bidder&apos;s submitted pages.
               </div>
-              <div className="px-6 py-4">
-                <input
-                  ref={tenderInputRef}
-                  type="file"
-                  accept=".pdf"
-                  className="hidden"
-                  onChange={handleTenderPdfUpload}
-                />
-                <button
-                  onClick={() => tenderInputRef.current?.click()}
-                  className={`inline-flex items-center gap-2 text-sm font-medium rounded-lg px-4 py-2 border transition-colors ${
-                    tenderPdfName
-                      ? "border-emerald-300 text-emerald-700 bg-emerald-50 hover:bg-emerald-100"
-                      : "border-gray-300 text-gray-600 bg-gray-50 hover:bg-gray-100"
-                  }`}
-                >
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" />
-                    <polyline points="14 2 14 8 20 8" />
-                    <line x1="12" y1="18" x2="12" y2="12" />
-                    <line x1="9" y1="15" x2="12" y2="12" />
-                    <line x1="15" y1="15" x2="12" y2="12" />
-                  </svg>
-                  {tenderPdfName ? "Replace Tender PDF" : "Upload Tender PDF"}
-                </button>
-                {!tenderPdfName && (
-                  <p className="text-xs text-gray-400 mt-2">
-                    Optional. When provided, a &ldquo;Match against Tender Page&rdquo; button will appear on rows 1 &amp; 2.
-                  </p>
-                )}
+            ) : (
+              <div className="flex items-center gap-2 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-4 py-2.5 mb-6">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="flex-shrink-0">
+                  <circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" />
+                </svg>
+                No Tender / NIT document uploaded. Go back to <strong className="mx-1">CPCL Tender AI</strong> and upload the NIT ZIP to enable page-level matching.
               </div>
-            </div>
+            )}
 
             {/* Tabs */}
             <div className="bg-white border border-gray-200 rounded-xl shadow-sm mb-6 overflow-hidden">

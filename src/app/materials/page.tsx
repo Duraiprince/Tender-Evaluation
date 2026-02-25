@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useState, useRef } from "react";
 import JSZip from "jszip";
 import { setBidderZip } from "@/lib/bidder-store";
+import { setNitZip } from "@/lib/nit-store";
 
 export default function MaterialsPage() {
   const router = useRouter();
@@ -54,6 +55,7 @@ export default function MaterialsPage() {
       return;
     }
     setBidderZip(bidderFile);
+    setNitZip(nitFile); // store NIT zip for tender page matching
     const id = tenderNumber.trim() || tenderName.trim().replace(/\s+/g, "-").toLowerCase();
     const params = new URLSearchParams({
       name: tenderName.trim(),

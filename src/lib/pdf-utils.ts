@@ -59,6 +59,30 @@ export interface MatchResult {
 
 const MIN_TEXT_LENGTH = 50;
 
+/**
+ * Title patterns used to locate the right pages in the tender (NIT) document.
+ * Keyed by evaluation row id (1 = Technical Specification, 2 = NIL Deviation Statement).
+ */
+export const ROW_TITLE_PATTERNS: Record<number, string[]> = {
+  1: [
+    "section – 3",
+    "section - 3",
+    "section–3",
+    "section-3",
+    "section 3",
+    "section 3 technical specification",
+    "technical specification",
+  ],
+  2: [
+    "8.3 - compliance to bid requirements deviation sheet",
+    "8.3 compliance to bid requirements",
+    "compliance to bid requirements deviation sheet",
+    "8.3 - compliance",
+    "nil deviation",
+    "deviation sheet",
+  ],
+};
+
 const PHYSICAL_SIGNATURE_MARKERS = [
   "authorized signatory",
   "authorised signatory",
@@ -143,6 +167,35 @@ export async function extractAllPages(pdfBuffer: Buffer): Promise<PageData[]> {
   } finally {
     await parser.destroy();
   }
+}
+
+// ─── findPagesByTitle ─────────────────────────────────────────────────────────
+
+/**
+ * Search a list of pages for those whose text contains any of the given title
+ * patterns within the first 600 characters (page header region).
+ *
+ * Dashes are normalised (em-dash, en-dash → hyphen) before comparing so that
+ * "SECTION – 3" matches "section - 3" etc.
+ */
+export function findPagesByTitle(
+  pages: PageData[],
+  titlePatterns: string[]
+): PageData[] {
+  const normalizeForMatch = (s: string) =>
+    s
+      .toLowerCase()
+      .replace(/[–—]/g, "-") // em/en dash → hyphen
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const normalizedPatterns = titlePatterns.map(normalizeForMatch);
+
+  return pages.filter((page) => {
+    // Check first 600 chars to focus on the page title area
+    const pageHead = normalizeForMatch(page.text.slice(0, 600));
+    return normalizedPatterns.some((pat) => pageHead.includes(pat));
+  });
 }
 
 // ─── 2. ocrIfNeeded ───────────────────────────────────────────────────────────
