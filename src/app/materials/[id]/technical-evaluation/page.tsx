@@ -134,22 +134,36 @@ export default function TechnicalEvaluationPage() {
     }
   }, [activeBidder, processingState, processBidderDocs]);
 
-  // Auto-determine evaluation status based on deviations and query
+  const SIGN_SEAL_KEYWORDS = ["sign", "seal", "signed", "sealed"];
+
+  const pageHasSignSeal = (pageText: string): boolean => {
+    const lower = pageText.toLowerCase();
+    return SIGN_SEAL_KEYWORDS.some((kw) => lower.includes(kw));
+  };
+
+  const matchesHaveSignSeal = (matches: DocMatch[]): boolean =>
+    matches.some((m) => pageHasSignSeal(m.pageText));
+
+  // Auto-determine evaluation status based on document matches and sign & seal presence
   useEffect(() => {
     if (!activeBidder || activeProcessing !== "done") return;
 
     const row1Matches = allActiveMatches.filter((m) => m.rowId === 1);
     const row2Matches = allActiveMatches.filter((m) => m.rowId === 2);
-    const hasDeviations = [...row1Matches, ...row2Matches].some((m) => m.pageText);
     const currentQuery = evaluations[activeBidder]?.query ?? "";
 
+    // Each required row must: (a) have at least one matching page, AND (b) that page has sign & seal
+    const row1Ok = row1Matches.length > 0 && matchesHaveSignSeal(row1Matches);
+    const row2Ok = row2Matches.length > 0 && matchesHaveSignSeal(row2Matches);
+    const allRequirementsMet = row1Ok && row2Ok;
+
     let newStatus: EvaluationStatus;
-    if (!hasDeviations) {
-      newStatus = "Qualified";
+    if (!allRequirementsMet) {
+      newStatus = "Not Qualified";
     } else if (currentQuery.trim()) {
       newStatus = "Query to be Raised";
     } else {
-      newStatus = "Not Qualified";
+      newStatus = "Qualified";
     }
 
     setEvaluations((prev) => {
@@ -233,16 +247,37 @@ export default function TechnicalEvaluationPage() {
     }
 
     if (activeProcessing === "done" && matches.length > 0) {
+      const rowHasSignSeal = matchesHaveSignSeal(matches);
       return (
         <div className="space-y-3">
+          {!rowHasSignSeal && (
+            <div className="flex items-center gap-2 text-xs text-red-600 font-medium bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="10" />
+                <line x1="12" y1="8" x2="12" y2="12" />
+                <line x1="12" y1="16" x2="12.01" y2="16" />
+              </svg>
+              Sign &amp; Seal not found on matched page(s)
+            </div>
+          )}
           {matches.map((match, i) => (
             <div key={i} className="space-y-1.5">
-              <div className="flex items-center gap-2 text-xs text-emerald-700 font-medium">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M9 12l2 2 4-4" />
-                  <circle cx="12" cy="12" r="10" />
-                </svg>
+              <div className={`flex items-center gap-2 text-xs font-medium ${pageHasSignSeal(match.pageText) ? "text-emerald-700" : "text-amber-700"}`}>
+                {pageHasSignSeal(match.pageText) ? (
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M9 12l2 2 4-4" />
+                    <circle cx="12" cy="12" r="10" />
+                  </svg>
+                ) : (
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" />
+                    <polyline points="14 2 14 8 20 8" />
+                  </svg>
+                )}
                 Found in {match.documentName} — Page {match.pageNumber}
+                {pageHasSignSeal(match.pageText) && (
+                  <span className="ml-1 text-emerald-600 font-semibold">· Signed &amp; Sealed</span>
+                )}
               </div>
               {match.imageDataUrl && (
                 <div
@@ -269,10 +304,11 @@ export default function TechnicalEvaluationPage() {
 
     if (activeProcessing === "done" && matches.length === 0) {
       return (
-        <div className="flex items-center gap-2 text-sm text-gray-400 py-2">
+        <div className="flex items-center gap-2 text-sm text-red-500 font-medium py-2">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <circle cx="11" cy="11" r="8" />
-            <line x1="21" y1="21" x2="16.65" y2="16.65" />
+            <circle cx="12" cy="12" r="10" />
+            <line x1="15" y1="9" x2="9" y2="15" />
+            <line x1="9" y1="9" x2="15" y2="15" />
           </svg>
           No matching pages found
         </div>

@@ -13,9 +13,7 @@ export const config = {
 interface SearchCriterion {
   rowId: number;
   primary: string;
-  primaryAlt: string[];
-  secondary: string;
-  secondaryAlt: string[];
+  primaryAlt: string[][];
 }
 
 interface MatchResult {
@@ -32,33 +30,31 @@ const CRITERIA: SearchCriterion[] = [
   {
     rowId: 1,
     primary: "section-3 of tender document",
-    primaryAlt: ["section-3", "section 3", "tender document"],
-    secondary: "sign & seal",
-    secondaryAlt: ["sign", "seal", "sign&seal", "signed", "sealed"],
+    primaryAlt: [
+      ["section-3", "technical specification"],
+      ["section 3", "technical specification"],
+      ["section-3", "tender document"],
+      ["section 3", "tender document"],
+    ],
   },
   {
     rowId: 2,
-    primary: "8.3 - compliance to bid requirements deviation sheet of tender document",
+    primary: "8.3 - compliance to bid requirements deviation sheet",
     primaryAlt: [
-      "compliance to bid requirements",
-      "deviation sheet",
-      "8.3",
+      ["8.3", "compliance to bid requirements"],
+      ["8.3", "deviation sheet"],
+      ["compliance to bid requirements", "deviation sheet"],
+      ["nil deviation", "statement"],
     ],
-    secondary: "sign & seal",
-    secondaryAlt: ["sign", "seal", "sign&seal", "signed", "sealed"],
   },
 ];
 
-function textMatchesPrimary(text: string, criterion: SearchCriterion): boolean {
+function textMatchesCriterion(text: string, criterion: SearchCriterion): boolean {
   const lower = text.toLowerCase();
   if (lower.includes(criterion.primary)) return true;
-  return criterion.primaryAlt.every((kw) => lower.includes(kw));
-}
-
-function textMatchesSecondary(text: string, criterion: SearchCriterion): boolean {
-  const lower = text.toLowerCase();
-  if (lower.includes(criterion.secondary)) return true;
-  return criterion.secondaryAlt.filter((kw) => lower.includes(kw)).length >= 2;
+  return criterion.primaryAlt.some((group) =>
+    group.every((kw) => lower.includes(kw))
+  );
 }
 
 function getFileExtension(name: string): string {
@@ -89,10 +85,7 @@ async function processPdf(
     for (const criterion of CRITERIA) {
       const matchedPages: number[] = [];
       for (const page of textResult.pages) {
-        if (
-          textMatchesPrimary(page.text, criterion) &&
-          textMatchesSecondary(page.text, criterion)
-        ) {
+        if (textMatchesCriterion(page.text, criterion)) {
           matchedPages.push(page.num);
         }
       }
@@ -150,10 +143,7 @@ async function processDocx(
   const { value: text } = await mammoth.extractRawText({ buffer: data });
 
   for (const criterion of CRITERIA) {
-    if (
-      textMatchesPrimary(text, criterion) &&
-      textMatchesSecondary(text, criterion)
-    ) {
+    if (textMatchesCriterion(text, criterion)) {
       results.push({
         rowId: criterion.rowId,
         bidder,
@@ -192,10 +182,7 @@ async function processImage(
   } = await Tesseract.recognize(Buffer.from(data), "eng");
 
   for (const criterion of CRITERIA) {
-    if (
-      textMatchesPrimary(text, criterion) &&
-      textMatchesSecondary(text, criterion)
-    ) {
+    if (textMatchesCriterion(text, criterion)) {
       const base64 = Buffer.from(data).toString("base64");
       results.push({
         rowId: criterion.rowId,
