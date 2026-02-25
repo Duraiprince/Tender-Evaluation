@@ -3,8 +3,9 @@
 import AppLayout from "@/components/AppLayout";
 import Link from "next/link";
 import { useParams, useSearchParams } from "next/navigation";
-import { useState, useMemo, useEffect, useCallback } from "react";
+import { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import { getBidderZip } from "@/lib/bidder-store";
+import { setTenderPdf, getTenderPdf, hasTenderPdf } from "@/lib/tender-store";
 
 interface EvaluationRow {
   id: number;
@@ -39,6 +40,36 @@ interface BidderEvaluation {
 }
 
 type ProcessingState = "idle" | "loading" | "done" | "error";
+
+// ── Tender page match types ───────────────────────────────────────────────────
+
+interface TenderMatchCandidate {
+  documentName: string;
+  pageNumber: number;
+  confidence: number;
+  pageData: { pageNumber: number; text: string; imageDataUrl: string };
+}
+
+interface TenderMatchResult {
+  status:
+    | "match_signed_digital"
+    | "match_signed_physical"
+    | "match_signed_both"
+    | "match_unsigned"
+    | "no_match";
+  match: TenderMatchCandidate | null;
+  topCandidates: TenderMatchCandidate[];
+  signatureInfo: {
+    digital: { detected: boolean; signerName?: string; signingTime?: string; validityStatus?: string };
+    physical: { detected: boolean; indicators: string[] };
+  } | null;
+}
+
+// Row id → tender page index (0-based)
+const ROW_TENDER_PAGE_MAP: Record<number, number> = {
+  1: 66, // Technical Specification → page 67 of tender (0-indexed: 66)
+  2: 66, // NIL Deviation Statement (same section; change as needed)
+};
 
 export default function TechnicalEvaluationPage() {
   const params = useParams();
@@ -76,6 +107,16 @@ export default function TechnicalEvaluationPage() {
   const [processingState, setProcessingState] = useState<Record<string, ProcessingState>>({});
   const [processingError, setProcessingError] = useState<Record<string, string>>({});
   const [expandedImage, setExpandedImage] = useState<string | null>(null);
+
+  // Tender PDF upload
+  const tenderInputRef = useRef<HTMLInputElement>(null);
+  const [tenderPdfName, setTenderPdfName] = useState<string>("");
+
+  // Tender page match state: key = `${bidder}:${rowId}`
+  const [matchResults, setMatchResults] = useState<Record<string, TenderMatchResult>>({});
+  const [matchLoading, setMatchLoading] = useState<Record<string, boolean>>({});
+  const [matchError, setMatchError] = useState<Record<string, string>>({});
+  const [matchPanelKey, setMatchPanelKey] = useState<string | null>(null);
 
   const activeBidder = bidders[activeTab] ?? "";
   const activeEval = evaluations[activeBidder];
@@ -133,6 +174,59 @@ export default function TechnicalEvaluationPage() {
       processBidderDocs(activeBidder);
     }
   }, [activeBidder, processingState, processBidderDocs]);
+
+  // Tender PDF upload handler
+  const handleTenderPdfUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0] ?? null;
+    setTenderPdf(file);
+    setTenderPdfName(file?.name ?? "");
+  };
+
+  // Run the tender page match for a specific row
+  const runTenderPageMatch = useCallback(
+    async (bidder: string, rowId: number) => {
+      const tenderPdf = getTenderPdf();
+      if (!tenderPdf) return;
+      const offerZip = getBidderZip();
+      if (!offerZip) return;
+
+      const key = `${bidder}:${rowId}`;
+      const tenderPageIndex = ROW_TENDER_PAGE_MAP[rowId] ?? 0;
+
+      setMatchLoading((p) => ({ ...p, [key]: true }));
+      setMatchError((p) => ({ ...p, [key]: "" }));
+      setMatchPanelKey(key);
+
+      try {
+        const formData = new FormData();
+        formData.append("tenderPdf", tenderPdf);
+        formData.append("offerZip", offerZip);
+        formData.append("bidder", bidder);
+        formData.append("tenderPageIndex", String(tenderPageIndex));
+
+        const res = await fetch("/api/match-tender-page", {
+          method: "POST",
+          body: formData,
+        });
+
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(errData.error || `Server error: ${res.status}`);
+        }
+
+        const result: TenderMatchResult = await res.json();
+        setMatchResults((p) => ({ ...p, [key]: result }));
+      } catch (err) {
+        setMatchError((p) => ({
+          ...p,
+          [key]: err instanceof Error ? err.message : "Match failed",
+        }));
+      } finally {
+        setMatchLoading((p) => ({ ...p, [key]: false }));
+      }
+    },
+    []
+  );
 
   const SIGN_SEAL_KEYWORDS = ["sign", "seal", "signed", "sealed"];
 
@@ -250,38 +344,46 @@ export default function TechnicalEvaluationPage() {
       const rowHasSignSeal = matchesHaveSignSeal(matches);
       return (
         <div className="space-y-3">
-          {!rowHasSignSeal && (
-            <div className="flex items-center gap-2 text-xs text-red-600 font-medium bg-red-50 border border-red-200 rounded-lg px-3 py-2">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <circle cx="12" cy="12" r="10" />
-                <line x1="12" y1="8" x2="12" y2="12" />
-                <line x1="12" y1="16" x2="12.01" y2="16" />
-              </svg>
-              Sign &amp; Seal not found on matched page(s)
-            </div>
-          )}
           {matches.map((match, i) => (
             <div key={i} className="space-y-1.5">
-              <div className={`flex items-center gap-2 text-xs font-medium ${pageHasSignSeal(match.pageText) ? "text-emerald-700" : "text-amber-700"}`}>
-                {pageHasSignSeal(match.pageText) ? (
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M9 12l2 2 4-4" />
+              {/* Submitted link — always shown when section is found */}
+              <button
+                onClick={() => match.imageDataUrl && setExpandedImage(match.imageDataUrl)}
+                className="inline-flex items-center gap-1.5 text-xs font-semibold text-blue-700 hover:text-blue-900 underline underline-offset-2 transition-colors"
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" />
+                  <polyline points="14 2 14 8 20 8" />
+                  <line x1="16" y1="13" x2="8" y2="13" />
+                  <line x1="16" y1="17" x2="8" y2="17" />
+                  <polyline points="10 9 9 9 8 9" />
+                </svg>
+                Submitted — {match.documentName}, Page {match.pageNumber}
+              </button>
+
+              {/* Sign & seal status badge */}
+              {pageHasSignSeal(match.pageText) ? (
+                <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 rounded px-2 py-0.5">
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M9 12l2 2 4-4" /><circle cx="12" cy="12" r="10" />
+                  </svg>
+                  Signed &amp; Sealed
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1 text-xs font-medium text-red-600 bg-red-50 border border-red-200 rounded px-2 py-0.5">
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                     <circle cx="12" cy="12" r="10" />
+                    <line x1="12" y1="8" x2="12" y2="12" />
+                    <line x1="12" y1="16" x2="12.01" y2="16" />
                   </svg>
-                ) : (
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" />
-                    <polyline points="14 2 14 8 20 8" />
-                  </svg>
-                )}
-                Found in {match.documentName} — Page {match.pageNumber}
-                {pageHasSignSeal(match.pageText) && (
-                  <span className="ml-1 text-emerald-600 font-semibold">· Signed &amp; Sealed</span>
-                )}
-              </div>
+                  Sign &amp; Seal not found
+                </span>
+              )}
+
+              {/* Page image thumbnail */}
               {match.imageDataUrl && (
                 <div
-                  className="relative border border-gray-200 rounded-lg overflow-hidden cursor-pointer group"
+                  className="relative border border-gray-200 rounded-lg overflow-hidden cursor-pointer group mt-1"
                   onClick={() => setExpandedImage(match.imageDataUrl)}
                 >
                   <img
@@ -298,6 +400,12 @@ export default function TechnicalEvaluationPage() {
               )}
             </div>
           ))}
+
+          {!rowHasSignSeal && (
+            <p className="text-xs text-red-500 mt-1">
+              Sign &amp; Seal missing — marked as Not Qualified
+            </p>
+          )}
         </div>
       );
     }
@@ -310,19 +418,166 @@ export default function TechnicalEvaluationPage() {
             <line x1="15" y1="9" x2="9" y2="15" />
             <line x1="9" y1="9" x2="15" y2="15" />
           </svg>
-          No matching pages found
+          Not Submitted
         </div>
       );
     }
 
+    return null;
+  };
+
+  // ── Tender page match panel ─────────────────────────────────────────────────
+  const renderMatchPanel = (rowId: number) => {
+    const key = `${activeBidder}:${rowId}`;
+    const isLoading = matchLoading[key];
+    const error = matchError[key];
+    const result = matchResults[key];
+
+    if (!hasTenderPdf()) return null;
+
+    if (!result && !isLoading && !error) {
+      return (
+        <button
+          onClick={() => runTenderPageMatch(activeBidder, rowId)}
+          className="mt-2 inline-flex items-center gap-1.5 text-xs font-medium text-indigo-700 hover:text-indigo-900 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 rounded-lg px-3 py-1.5 transition-colors"
+        >
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
+          </svg>
+          Match against Tender Page {(ROW_TENDER_PAGE_MAP[rowId] ?? 0) + 1}
+        </button>
+      );
+    }
+
+    if (isLoading) {
+      return (
+        <div className="mt-2 flex items-center gap-2 text-xs text-indigo-600 bg-indigo-50 border border-indigo-200 rounded-lg px-3 py-2">
+          <div className="w-3.5 h-3.5 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin flex-shrink-0" />
+          Scanning bidder documents for tender page match…
+        </div>
+      );
+    }
+
+    if (error) {
+      return (
+        <div className="mt-2 space-y-1">
+          <div className="flex items-center gap-1.5 text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="10" /><line x1="15" y1="9" x2="9" y2="15" /><line x1="9" y1="9" x2="15" y2="15" />
+            </svg>
+            {error}
+          </div>
+          <button
+            onClick={() => runTenderPageMatch(activeBidder, rowId)}
+            className="text-xs text-indigo-600 hover:underline"
+          >
+            Retry
+          </button>
+        </div>
+      );
+    }
+
+    if (!result) return null;
+
+    const { status, match, signatureInfo } = result;
+
+    if (status === "no_match" || !match) {
+      return (
+        <div className="mt-2 flex items-center gap-2 text-xs font-medium text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="12" cy="12" r="10" /><line x1="15" y1="9" x2="9" y2="15" /><line x1="9" y1="9" x2="15" y2="15" />
+          </svg>
+          {activeBidder} has not submitted a matching copy of Tender Page {(ROW_TENDER_PAGE_MAP[rowId] ?? 0) + 1}
+        </div>
+      );
+    }
+
+    const sigLabel =
+      status === "match_signed_both"
+        ? "Digitally & Physically Signed"
+        : status === "match_signed_digital"
+          ? "Digitally Signed"
+          : status === "match_signed_physical"
+            ? "Physically Signed"
+            : null;
+
+    const confidencePct = Math.round(match.confidence * 100);
+
     return (
-      <input
-        type="text"
-        value={activeEval?.rows.find((r) => r.id === rowId)?.bidderValue ?? ""}
-        onChange={(e) => updateBidderValue(rowId, e.target.value)}
-        placeholder="Enter response"
-        className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm text-gray-900 placeholder:text-gray-300 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-400 transition-all bg-white"
-      />
+      <div className="mt-2 border border-indigo-200 rounded-xl overflow-hidden">
+        {/* Header */}
+        <div className="flex items-center justify-between px-3 py-2 bg-indigo-50 border-b border-indigo-200">
+          <span className="text-xs font-semibold text-indigo-800">
+            Tender Page Match — {match.documentName}, Page {match.pageNumber}
+          </span>
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-indigo-600 font-medium">
+              {confidencePct}% confidence
+            </span>
+            <button
+              onClick={() => runTenderPageMatch(activeBidder, rowId)}
+              title="Re-run match"
+              className="text-indigo-500 hover:text-indigo-700 transition-colors"
+            >
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="23 4 23 10 17 10" />
+                <path d="M20.49 15a9 9 0 11-2.12-9.36L23 10" />
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        {/* Signature badges */}
+        <div className="px-3 py-2 flex flex-wrap gap-2 bg-white border-b border-indigo-100">
+          {sigLabel ? (
+            <span className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-full px-2.5 py-0.5">
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M9 12l2 2 4-4" /><circle cx="12" cy="12" r="10" />
+              </svg>
+              {sigLabel}
+            </span>
+          ) : (
+            <span className="inline-flex items-center gap-1 text-xs font-semibold text-amber-700 bg-amber-50 border border-amber-200 rounded-full px-2.5 py-0.5">
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" />
+              </svg>
+              Match found but signature not detected
+            </span>
+          )}
+
+          {signatureInfo?.digital.detected && (
+            <span className="text-xs text-gray-500">
+              Signer: {signatureInfo.digital.signerName ?? "Unknown"}
+              {signatureInfo.digital.signingTime && ` · ${signatureInfo.digital.signingTime}`}
+            </span>
+          )}
+
+          {signatureInfo?.physical.detected && signatureInfo.physical.indicators.length > 0 && (
+            <span className="text-xs text-gray-500">
+              Markers: {signatureInfo.physical.indicators.slice(0, 3).join(", ")}
+            </span>
+          )}
+        </div>
+
+        {/* Page image */}
+        {match.pageData.imageDataUrl && (
+          <div
+            className="relative cursor-pointer group"
+            onClick={() => setExpandedImage(match.pageData.imageDataUrl)}
+          >
+            <img
+              src={match.pageData.imageDataUrl}
+              alt={`${match.documentName} page ${match.pageNumber}`}
+              className="w-full h-auto max-h-64 object-contain bg-gray-50"
+            />
+            <div className="absolute inset-0 bg-black/0 group-hover:bg-black/10 transition-colors flex items-center justify-center">
+              <span className="opacity-0 group-hover:opacity-100 transition-opacity text-xs bg-black/60 text-white px-2 py-1 rounded">
+                Click to expand
+              </span>
+            </div>
+          </div>
+        )}
+      </div>
     );
   };
 
@@ -446,6 +701,56 @@ export default function TechnicalEvaluationPage() {
           </div>
         ) : (
           <>
+            {/* Tender PDF Upload Strip */}
+            <div className="bg-white border border-gray-200 rounded-xl shadow-sm mb-6 overflow-hidden">
+              <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
+                <div>
+                  <h2 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">
+                    Tender Document (for Page Match)
+                  </h2>
+                  <p className="text-xs text-gray-400 mt-0.5">
+                    Upload the tender PDF to enable page-by-page matching against bidder submissions
+                  </p>
+                </div>
+                {tenderPdfName && (
+                  <span className="text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-1.5">
+                    {tenderPdfName}
+                  </span>
+                )}
+              </div>
+              <div className="px-6 py-4">
+                <input
+                  ref={tenderInputRef}
+                  type="file"
+                  accept=".pdf"
+                  className="hidden"
+                  onChange={handleTenderPdfUpload}
+                />
+                <button
+                  onClick={() => tenderInputRef.current?.click()}
+                  className={`inline-flex items-center gap-2 text-sm font-medium rounded-lg px-4 py-2 border transition-colors ${
+                    tenderPdfName
+                      ? "border-emerald-300 text-emerald-700 bg-emerald-50 hover:bg-emerald-100"
+                      : "border-gray-300 text-gray-600 bg-gray-50 hover:bg-gray-100"
+                  }`}
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" />
+                    <polyline points="14 2 14 8 20 8" />
+                    <line x1="12" y1="18" x2="12" y2="12" />
+                    <line x1="9" y1="15" x2="12" y2="12" />
+                    <line x1="15" y1="15" x2="12" y2="12" />
+                  </svg>
+                  {tenderPdfName ? "Replace Tender PDF" : "Upload Tender PDF"}
+                </button>
+                {!tenderPdfName && (
+                  <p className="text-xs text-gray-400 mt-2">
+                    Optional. When provided, a &ldquo;Match against Tender Page&rdquo; button will appear on rows 1 &amp; 2.
+                  </p>
+                )}
+              </div>
+            </div>
+
             {/* Tabs */}
             <div className="bg-white border border-gray-200 rounded-xl shadow-sm mb-6 overflow-hidden">
               <div className="px-6 py-4 border-b border-gray-100">
@@ -547,7 +852,10 @@ export default function TechnicalEvaluationPage() {
                             </td>
                             <td className="px-4 py-4 align-top">
                               {row.id === 1 || row.id === 2 ? (
-                                renderOcrCell(row.id)
+                                <div>
+                                  {renderOcrCell(row.id)}
+                                  {renderMatchPanel(row.id)}
+                                </div>
                               ) : row.id === 3 ? (
                                 <span className="text-sm text-gray-700">Complied / Not complied</span>
                               ) : row.id === 4 ? (
