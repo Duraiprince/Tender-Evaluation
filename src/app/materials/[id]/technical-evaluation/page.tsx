@@ -71,6 +71,7 @@ interface TenderMatchResult {
     physical: { detected: boolean; indicators: string[] };
   } | null;
   tenderPage: TenderPageRef | null;
+  nextPage: TenderPageRef | null;
 }
 
 // Human-readable section labels per row id
@@ -224,31 +225,40 @@ export default function TechnicalEvaluationPage() {
     []
   );
 
-  const SIGN_SEAL_KEYWORDS = ["sign", "seal", "signed", "sealed"];
+  // Auto-run tender page matching for rows 1 & 2 once doc processing completes
+  useEffect(() => {
+    if (!activeBidder || activeProcessing !== "done") return;
+    [1, 2].forEach((rowId) => {
+      const key = `${activeBidder}:${rowId}`;
+      if (!matchResults[key] && !matchLoading[key]) {
+        runTenderPageMatch(activeBidder, rowId);
+      }
+    });
+  }, [activeBidder, activeProcessing, matchResults, matchLoading, runTenderPageMatch]);
 
-  const pageHasSignSeal = (pageText: string): boolean => {
-    const lower = pageText.toLowerCase();
-    return SIGN_SEAL_KEYWORDS.some((kw) => lower.includes(kw));
-  };
-
-  const matchesHaveSignSeal = (matches: DocMatch[]): boolean =>
-    matches.some((m) => pageHasSignSeal(m.pageText));
-
-  // Auto-determine evaluation status based on document matches and sign & seal presence
+  // Auto-determine evaluation status based on whether tender page match was found
   useEffect(() => {
     if (!activeBidder || activeProcessing !== "done") return;
 
-    const row1Matches = allActiveMatches.filter((m) => m.rowId === 1);
-    const row2Matches = allActiveMatches.filter((m) => m.rowId === 2);
+    const key1 = `${activeBidder}:1`;
+    const key2 = `${activeBidder}:2`;
+    const result1 = matchResults[key1];
+    const result2 = matchResults[key2];
+
+    // Wait until both tender match results are available before setting status
+    if (!result1 || !result2) return;
+
     const currentQuery = evaluations[activeBidder]?.query ?? "";
 
-    // Each required row must: (a) have at least one matching page, AND (b) that page has sign & seal
-    const row1Ok = row1Matches.length > 0 && matchesHaveSignSeal(row1Matches);
-    const row2Ok = row2Matches.length > 0 && matchesHaveSignSeal(row2Matches);
-    const allRequirementsMet = row1Ok && row2Ok;
+    // A row passes when any match is found (regardless of signature status)
+    const rowMatchFound = (r: TenderMatchResult) => r.status !== "no_match";
+
+    const row1Ok = rowMatchFound(result1);
+    const row2Ok = rowMatchFound(result2);
+    const allSubmitted = row1Ok && row2Ok;
 
     let newStatus: EvaluationStatus;
-    if (!allRequirementsMet) {
+    if (!allSubmitted) {
       newStatus = "Not Qualified";
     } else if (currentQuery.trim()) {
       newStatus = "Query to be Raised";
@@ -263,7 +273,7 @@ export default function TechnicalEvaluationPage() {
         [activeBidder]: { ...prev[activeBidder], evaluationStatus: newStatus },
       };
     });
-  }, [activeBidder, activeProcessing, allActiveMatches, evaluations]);
+  }, [activeBidder, activeProcessing, matchResults, evaluations]);
 
   const updateField = <K extends keyof BidderEvaluation>(
     field: K,
@@ -305,6 +315,9 @@ export default function TechnicalEvaluationPage() {
 
   const renderOcrCell = (rowId: number) => {
     const matches = getMatchesForRow(rowId);
+    const matchKey = `${activeBidder}:${rowId}`;
+    const tenderMatchResult = matchResults[matchKey];
+    const isTenderMatchLoading = matchLoading[matchKey] ?? false;
 
     if (activeProcessing === "loading") {
       return (
@@ -336,50 +349,61 @@ export default function TechnicalEvaluationPage() {
       );
     }
 
-    if (activeProcessing === "done" && matches.length > 0) {
-      const rowHasSignSeal = matchesHaveSignSeal(matches);
+    if (activeProcessing !== "done") return null;
+
+    // Primary: use tender match result; fallback: keyword-based doc matches
+    const hasTenderMatch = tenderMatchResult && tenderMatchResult.status !== "no_match";
+    const hasDocMatch = matches.length > 0;
+
+    // While tender matching is in progress and no doc match yet, show a verifying indicator
+    if (isTenderMatchLoading && !hasDocMatch) {
       return (
-        <div className="space-y-3">
-          {matches.map((match, i) => (
-            <div key={i} className="space-y-1.5">
-              {/* Submitted link — always shown when section is found */}
-              <button
-                onClick={() => match.imageDataUrl && setExpandedImage(match.imageDataUrl)}
-                className="inline-flex items-center gap-1.5 text-xs font-semibold text-blue-700 hover:text-blue-900 underline underline-offset-2 transition-colors"
-              >
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" />
-                  <polyline points="14 2 14 8 20 8" />
-                  <line x1="16" y1="13" x2="8" y2="13" />
-                  <line x1="16" y1="17" x2="8" y2="17" />
-                  <polyline points="10 9 9 9 8 9" />
-                </svg>
-                Submitted — {match.documentName}, Page {match.pageNumber}
-              </button>
+        <div className="flex items-center gap-2 py-2 text-xs text-indigo-600">
+          <div className="w-4 h-4 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin flex-shrink-0" />
+          Verifying against tender document...
+        </div>
+      );
+    }
 
-              {/* Sign & seal status badge */}
-              {pageHasSignSeal(match.pageText) ? (
-                <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 rounded px-2 py-0.5">
-                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M9 12l2 2 4-4" /><circle cx="12" cy="12" r="10" />
-                  </svg>
-                  Signed &amp; Sealed
-                </span>
-              ) : (
-                <span className="inline-flex items-center gap-1 text-xs font-medium text-red-600 bg-red-50 border border-red-200 rounded px-2 py-0.5">
-                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                    <circle cx="12" cy="12" r="10" />
-                    <line x1="12" y1="8" x2="12" y2="12" />
-                    <line x1="12" y1="16" x2="12.01" y2="16" />
-                  </svg>
-                  Sign &amp; Seal not found
-                </span>
-              )}
+    // Not submitted — shown when both matching sources confirm no match
+    if (!hasTenderMatch && !hasDocMatch) {
+      return (
+        <div className="flex items-center gap-2 text-sm text-red-500 font-medium py-2">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="12" cy="12" r="10" />
+            <line x1="15" y1="9" x2="9" y2="15" />
+            <line x1="9" y1="9" x2="15" y2="15" />
+          </svg>
+          Not Submitted
+        </div>
+      );
+    }
 
-              {/* Page image thumbnail */}
-              {match.imageDataUrl && (
+    // Display reference label (prefer tender match data, fall back to doc matches)
+    const displayRef = hasTenderMatch && tenderMatchResult!.match
+      ? { documentName: tenderMatchResult!.match.documentName, pageNumber: tenderMatchResult!.match.pageNumber }
+      : hasDocMatch
+      ? { documentName: matches[0].documentName, pageNumber: matches[0].pageNumber }
+      : null;
+
+    return (
+      <div className="space-y-2">
+        {/* Submitted status */}
+        <div className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-700">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M9 12l2 2 4-4" /><circle cx="12" cy="12" r="10" />
+          </svg>
+          Submitted{displayRef ? ` — ${displayRef.documentName}, Page ${displayRef.pageNumber}` : ""}
+        </div>
+
+        {/* Show doc match thumbnails only when no tender match panel will be rendered */}
+        {!hasTenderMatch && hasDocMatch && (
+          <div className="space-y-3 mt-1">
+            {matches.map((match, i) =>
+              match.imageDataUrl ? (
                 <div
-                  className="relative border border-gray-200 rounded-lg overflow-hidden cursor-pointer group mt-1"
+                  key={i}
+                  className="relative border border-gray-200 rounded-lg overflow-hidden cursor-pointer group"
                   onClick={() => setExpandedImage(match.imageDataUrl)}
                 >
                   <img
@@ -393,33 +417,12 @@ export default function TechnicalEvaluationPage() {
                     </span>
                   </div>
                 </div>
-              )}
-            </div>
-          ))}
-
-          {!rowHasSignSeal && (
-            <p className="text-xs text-red-500 mt-1">
-              Sign &amp; Seal missing — marked as Not Qualified
-            </p>
-          )}
-        </div>
-      );
-    }
-
-    if (activeProcessing === "done" && matches.length === 0) {
-      return (
-        <div className="flex items-center gap-2 text-sm text-red-500 font-medium py-2">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <circle cx="12" cy="12" r="10" />
-            <line x1="15" y1="9" x2="9" y2="15" />
-            <line x1="9" y1="9" x2="15" y2="15" />
-          </svg>
-          Not Submitted
-        </div>
-      );
-    }
-
-    return null;
+              ) : null
+            )}
+          </div>
+        )}
+      </div>
+    );
   };
 
   // ── Tender page match panel ─────────────────────────────────────────────────
@@ -472,7 +475,7 @@ export default function TechnicalEvaluationPage() {
 
     if (!result) return null;
 
-    const { status, match, signatureInfo, tenderPage } = result;
+    const { status, match, signatureInfo, tenderPage, nextPage } = result;
 
     // No match found
     if (status === "no_match" || !match) {
@@ -506,13 +509,6 @@ export default function TechnicalEvaluationPage() {
       );
     }
 
-    // Match found — determine signature label
-    const sigLabel =
-      status === "match_signed_both" ? "Digitally & Physically Signed"
-      : status === "match_signed_digital" ? "Digitally Signed"
-      : status === "match_signed_physical" ? "Physically Signed"
-      : null;
-
     const confidencePct = Math.round(match.confidence * 100);
 
     return (
@@ -534,36 +530,6 @@ export default function TechnicalEvaluationPage() {
               <polyline points="23 4 23 10 17 10" /><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10" />
             </svg>
           </button>
-        </div>
-
-        {/* Signature badge row */}
-        <div className="px-3 py-2 flex flex-wrap items-center gap-2 bg-white border-b border-indigo-100">
-          {sigLabel ? (
-            <span className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-full px-2.5 py-0.5">
-              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M9 12l2 2 4-4" /><circle cx="12" cy="12" r="10" />
-              </svg>
-              {sigLabel}
-            </span>
-          ) : (
-            <span className="inline-flex items-center gap-1 text-xs font-semibold text-amber-700 bg-amber-50 border border-amber-200 rounded-full px-2.5 py-0.5">
-              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" />
-              </svg>
-              Match found but signature not detected
-            </span>
-          )}
-          {signatureInfo?.digital.detected && (
-            <span className="text-xs text-gray-500">
-              Signer: {signatureInfo.digital.signerName ?? "Unknown"}
-              {signatureInfo.digital.signingTime && ` · ${signatureInfo.digital.signingTime}`}
-            </span>
-          )}
-          {signatureInfo?.physical.detected && signatureInfo.physical.indicators.length > 0 && (
-            <span className="text-xs text-gray-400">
-              Indicators: {signatureInfo.physical.indicators.slice(0, 3).join(", ")}
-            </span>
-          )}
         </div>
 
         {/* Side-by-side: tender reference page vs bidder submitted page */}
@@ -719,23 +685,6 @@ export default function TechnicalEvaluationPage() {
           </div>
         ) : (
           <>
-            {/* NIT zip availability notice */}
-            {nitAvailable ? (
-              <div className="flex items-center gap-2 text-xs text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-lg px-4 py-2.5 mb-6">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="flex-shrink-0">
-                  <path d="M9 12l2 2 4-4" /><circle cx="12" cy="12" r="10" />
-                </svg>
-                Tender / NIT document is loaded — click <strong className="mx-1">Match against Tender Document</strong> on rows 1 &amp; 2 to find and verify the bidder&apos;s submitted pages.
-              </div>
-            ) : (
-              <div className="flex items-center gap-2 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-4 py-2.5 mb-6">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="flex-shrink-0">
-                  <circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" />
-                </svg>
-                No Tender / NIT document uploaded. Go back to <strong className="mx-1">CPCL Tender AI</strong> and upload the NIT ZIP to enable page-level matching.
-              </div>
-            )}
-
             {/* Tabs */}
             <div className="bg-white border border-gray-200 rounded-xl shadow-sm mb-6 overflow-hidden">
               <div className="px-6 py-4 border-b border-gray-100">

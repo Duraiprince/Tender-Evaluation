@@ -208,8 +208,29 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       else status = "match_unsigned";
     }
 
+    // ── 6. Capture next page when match found but no signature/seal detected ──
+    // Helps evaluator verify if sign & seal appears on the following page.
+    let nextPageRef: { pageNumber: number; documentName: string; imageDataUrl: string; text: string } | null = null;
+
+    if (bestMatch && status === "match_unsigned") {
+      const nextPageNumber = bestMatch.pageData.pageNumber + 1;
+      const matchDocName = bestMatch.documentName;
+      const nextPage = bidderPages.find(
+        (p) => p.pageNumber === nextPageNumber && p._docName === matchDocName
+      );
+      if (nextPage) {
+        nextPageRef = {
+          pageNumber: nextPage.pageNumber,
+          documentName: nextPage._docName,
+          imageDataUrl: nextPage.imageDataUrl,
+          text: nextPage.text,
+        };
+      }
+    }
+
     const result: MatchResult & {
       tenderPage: { pageNumber: number; documentName: string; imageDataUrl: string; text: string } | null;
+      nextPage: { pageNumber: number; documentName: string; imageDataUrl: string; text: string } | null;
     } = {
       status,
       match: bestMatch,
@@ -223,6 +244,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
             text: tenderPageRef.text,
           }
         : null,
+      nextPage: nextPageRef,
     };
 
     return NextResponse.json(result);
